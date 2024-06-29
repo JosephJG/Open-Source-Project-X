@@ -1,32 +1,52 @@
 package log_test
 
 import (
+	"context"
 	"testing"
 
-	"github.com/google/go-cmp/cmp"
-	"github.com/xtls/xray-core/common/log"
-	"github.com/xtls/xray-core/common/net"
+	"github.com/golang/mock/gomock"
+	"github.com/xtls/xray-core/app/log"
+	"github.com/xtls/xray-core/common"
+	clog "github.com/xtls/xray-core/common/log"
+	"github.com/xtls/xray-core/testing/mocks"
 )
 
-type testLogger struct {
-	value string
-}
+func TestCustomLogHandler(t *testing.T) {
+	mockCtl := gomock.NewController(t)
+	defer mockCtl.Finish()
 
-func (l *testLogger) Handle(msg log.Message) {
-	l.value = msg.String()
-}
+	var loggedValue []string
 
-func TestLogRecord(t *testing.T) {
-	var logger testLogger
-	log.RegisterHandler(&logger)
-
-	ip := "8.8.8.8"
-	log.Record(&log.GeneralMessage{
-		Severity: log.Severity_Error,
-		Content:  net.ParseAddress(ip),
+	mockHandler := mocks.NewLogHandler(mockCtl)
+	mockHandler.EXPECT().Handle(gomock.Any()).AnyTimes().DoAndReturn(func(msg clog.Message) {
+		loggedValue = append(loggedValue, msg.String())
 	})
 
-	if diff := cmp.Diff("[Error] "+ip, logger.value); diff != "" {
-		t.Error(diff)
+	log.RegisterHandlerCreator(log.LogType_Console, func(lt log.LogType, options log.HandlerCreatorOptions) (clog.Handler, error) {
+		return mockHandler, nil
+	})
+
+	logger, err := log.New(context.Background(), &log.Config{
+		ErrorLogLevel: clog.Severity_Debug,
+		ErrorLogType:  log.LogType_Console,
+		AccessLogType: log.LogType_None,
+	})
+	common.Must(err)
+
+	common.Must(logger.Start())
+
+	clog.Record(&clog.GeneralMessage{
+		Severity: clog.Severity_Debug,
+		Content:  "test",
+	})
+
+	if len(loggedValue) < 2 {
+		t.Fatal("expected 2 log messages, but actually ", loggedValue)
 	}
+
+	if loggedValue[1] != "[Debug] test" {
+		t.Fatal("expected '[Debug] test', but actually ", loggedValue[1])
+	}
+
+	common.Must(logger.Close())
 }

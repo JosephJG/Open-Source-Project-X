@@ -1,370 +1,311 @@
+// Package dns is an implementation of core.DNS feature.
 package dns
+
+//go:generate go run github.com/xtls/xray-core/common/errors/errorgen
 
 import (
 	"context"
-	"io"
+	"fmt"
+	"strings"
 	"sync"
-	"time"
 
+	"github.com/xtls/xray-core/app/router"
 	"github.com/xtls/xray-core/common"
-	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
-	dns_proto "github.com/xtls/xray-core/common/protocol/dns"
 	"github.com/xtls/xray-core/common/session"
-	"github.com/xtls/xray-core/common/signal"
-	"github.com/xtls/xray-core/common/task"
-	"github.com/xtls/xray-core/core"
+	"github.com/xtls/xray-core/common/strmatcher"
+	"github.com/xtls/xray-core/features"
 	"github.com/xtls/xray-core/features/dns"
-	"github.com/xtls/xray-core/features/policy"
-	"github.com/xtls/xray-core/transport"
-	"github.com/xtls/xray-core/transport/internet"
-	"github.com/xtls/xray-core/transport/internet/stat"
-	"golang.org/x/net/dns/dnsmessage"
 )
+
+// DNS is a DNS rely server.
+type DNS struct {
+	sync.Mutex
+	tag                    string
+	disableCache           bool
+	disableFallback        bool
+	disableFallbackIfMatch bool
+	ipOption               *dns.IPOption
+	hosts                  *StaticHosts
+	clients                []*Client
+	ctx                    context.Context
+	domainMatcher          strmatcher.IndexMatcher
+	matcherInfos           []*DomainMatcherInfo
+}
+
+// DomainMatcherInfo contains information attached to index returned by Server.domainMatcher
+type DomainMatcherInfo struct {
+	clientIdx     uint16
+	domainRuleIdx uint16
+}
+
+// New creates a new DNS server with given configuration.
+func New(ctx context.Context, config *Config) (*DNS, error) {
+	var tag string
+	if len(config.Tag) > 0 {
+		tag = config.Tag
+	} else {
+		tag = generateRandomTag()
+	}
+
+	var clientIP net.IP
+	switch len(config.ClientIp) {
+	case 0, net.IPv4len, net.IPv6len:
+		clientIP = net.IP(config.ClientIp)
+	default:
+		return nil, errors.New("unexpected client IP length ", len(config.ClientIp))
+	}
+
+	var ipOption *dns.IPOption
+	switch config.QueryStrategy {
+	case QueryStrategy_USE_IP:
+		ipOption = &dns.IPOption{
+			IPv4Enable: true,
+			IPv6Enable: true,
+			FakeEnable: false,
+		}
+	case QueryStrategy_USE_IP4:
+		ipOption = &dns.IPOption{
+			IPv4Enable: true,
+			IPv6Enable: false,
+			FakeEnable: false,
+		}
+	case QueryStrategy_USE_IP6:
+		ipOption = &dns.IPOption{
+			IPv4Enable: false,
+			IPv6Enable: true,
+			FakeEnable: false,
+		}
+	}
+
+	hosts, err := NewStaticHosts(config.StaticHosts, config.Hosts)
+	if err != nil {
+		return nil, errors.New("failed to create hosts").Base(err)
+	}
+
+	clients := []*Client{}
+	domainRuleCount := 0
+	for _, ns := range config.NameServer {
+		domainRuleCount += len(ns.PrioritizedDomain)
+	}
+
+	// MatcherInfos is ensured to cover the maximum index domainMatcher could return, where matcher's index starts from 1
+	matcherInfos := make([]*DomainMatcherInfo, domainRuleCount+1)
+	domainMatcher := &strmatcher.MatcherGroup{}
+	geoipContainer := router.GeoIPMatcherContainer{}
+
+	for _, endpoint := range config.NameServers {
+		features.PrintDeprecatedFeatureWarning("simple DNS server")
+		client, err := NewSimpleClient(ctx, endpoint, clientIP)
+		if err != nil {
+			return nil, errors.New("failed to create client").Base(err)
+		}
+		clients = append(clients, client)
+	}
+
+	for _, ns := range config.NameServer {
+		clientIdx := len(clients)
+		updateDomain := func(domainRule strmatcher.Matcher, originalRuleIdx int, matcherInfos []*DomainMatcherInfo) error {
+			midx := domainMatcher.Add(domainRule)
+			matcherInfos[midx] = &DomainMatcherInfo{
+				clientIdx:     uint16(clientIdx),
+				domainRuleIdx: uint16(originalRuleIdx),
+			}
+			return nil
+		}
+
+		myClientIP := clientIP
+		switch len(ns.ClientIp) {
+		case net.IPv4len, net.IPv6len:
+			myClientIP = net.IP(ns.ClientIp)
+		}
+		client, err := NewClient(ctx, ns, myClientIP, geoipContainer, &matcherInfos, updateDomain)
+		if err != nil {
+			return nil, errors.New("failed to create client").Base(err)
+		}
+		clients = append(clients, client)
+	}
+
+	// If there is no DNS client in config, add a `localhost` DNS client
+	if len(clients) == 0 {
+		clients = append(clients, NewLocalDNSClient())
+	}
+
+	return &DNS{
+		tag:                    tag,
+		hosts:                  hosts,
+		ipOption:               ipOption,
+		clients:                clients,
+		ctx:                    ctx,
+		domainMatcher:          domainMatcher,
+		matcherInfos:           matcherInfos,
+		disableCache:           config.DisableCache,
+		disableFallback:        config.DisableFallback,
+		disableFallbackIfMatch: config.DisableFallbackIfMatch,
+	}, nil
+}
+
+// Type implements common.HasType.
+func (*DNS) Type() interface{} {
+	return dns.ClientType()
+}
+
+// Start implements common.Runnable.
+func (s *DNS) Start() error {
+	return nil
+}
+
+// Close implements common.Closable.
+func (s *DNS) Close() error {
+	return nil
+}
+
+// IsOwnLink implements proxy.dns.ownLinkVerifier
+func (s *DNS) IsOwnLink(ctx context.Context) bool {
+	inbound := session.InboundFromContext(ctx)
+	return inbound != nil && inbound.Tag == s.tag
+}
+
+// LookupIP implements dns.Client.
+func (s *DNS) LookupIP(domain string, option dns.IPOption) ([]net.IP, error) {
+	if domain == "" {
+		return nil, errors.New("empty domain name")
+	}
+
+	option.IPv4Enable = option.IPv4Enable && s.ipOption.IPv4Enable
+	option.IPv6Enable = option.IPv6Enable && s.ipOption.IPv6Enable
+
+	if !option.IPv4Enable && !option.IPv6Enable {
+		return nil, dns.ErrEmptyResponse
+	}
+
+	// Normalize the FQDN form query
+	domain = strings.TrimSuffix(domain, ".")
+
+	// Static host lookup
+	switch addrs := s.hosts.Lookup(domain, option); {
+	case addrs == nil: // Domain not recorded in static host
+		break
+	case len(addrs) == 0: // Domain recorded, but no valid IP returned (e.g. IPv4 address with only IPv6 enabled)
+		return nil, dns.ErrEmptyResponse
+	case len(addrs) == 1 && addrs[0].Family().IsDomain(): // Domain replacement
+		errors.LogInfo(s.ctx, "domain replaced: ", domain, " -> ", addrs[0].Domain())
+		domain = addrs[0].Domain()
+	default: // Successfully found ip records in static host
+		errors.LogInfo(s.ctx, "returning ", len(addrs), " IP(s) for domain ", domain, " -> ", addrs)
+		return toNetIP(addrs)
+	}
+
+	// Name servers lookup
+	errs := []error{}
+	ctx := session.ContextWithInbound(s.ctx, &session.Inbound{Tag: s.tag})
+	for _, client := range s.sortClients(domain) {
+		if !option.FakeEnable && strings.EqualFold(client.Name(), "FakeDNS") {
+			errors.LogDebug(s.ctx, "skip DNS resolution for domain ", domain, " at server ", client.Name())
+			continue
+		}
+		ips, err := client.QueryIP(ctx, domain, option, s.disableCache)
+		if len(ips) > 0 {
+			return ips, nil
+		}
+		if err != nil {
+			errors.LogInfoInner(s.ctx, err, "failed to lookup ip for domain ", domain, " at server ", client.Name())
+			errs = append(errs, err)
+		}
+		// 5 for RcodeRefused in miekg/dns, hardcode to reduce binary size
+		if err != context.Canceled && err != context.DeadlineExceeded && err != errExpectedIPNonMatch && err != dns.ErrEmptyResponse && dns.RCodeFromError(err) != 5 {
+			return nil, err
+		}
+	}
+
+	return nil, errors.New("returning nil for domain ", domain).Base(errors.Combine(errs...))
+}
+
+// LookupHosts implements dns.HostsLookup.
+func (s *DNS) LookupHosts(domain string) *net.Address {
+	domain = strings.TrimSuffix(domain, ".")
+	if domain == "" {
+		return nil
+	}
+	// Normalize the FQDN form query
+	addrs := s.hosts.Lookup(domain, *s.ipOption)
+	if len(addrs) > 0 {
+		errors.LogInfo(s.ctx, "domain replaced: ", domain, " -> ", addrs[0].String())
+		return &addrs[0]
+	}
+
+	return nil
+}
+
+// GetIPOption implements ClientWithIPOption.
+func (s *DNS) GetIPOption() *dns.IPOption {
+	return s.ipOption
+}
+
+// SetQueryOption implements ClientWithIPOption.
+func (s *DNS) SetQueryOption(isIPv4Enable, isIPv6Enable bool) {
+	s.ipOption.IPv4Enable = isIPv4Enable
+	s.ipOption.IPv6Enable = isIPv6Enable
+}
+
+// SetFakeDNSOption implements ClientWithIPOption.
+func (s *DNS) SetFakeDNSOption(isFakeEnable bool) {
+	s.ipOption.FakeEnable = isFakeEnable
+}
+
+func (s *DNS) sortClients(domain string) []*Client {
+	clients := make([]*Client, 0, len(s.clients))
+	clientUsed := make([]bool, len(s.clients))
+	clientNames := make([]string, 0, len(s.clients))
+	domainRules := []string{}
+
+	// Priority domain matching
+	hasMatch := false
+	for _, match := range s.domainMatcher.Match(domain) {
+		info := s.matcherInfos[match]
+		client := s.clients[info.clientIdx]
+		domainRule := client.domains[info.domainRuleIdx]
+		domainRules = append(domainRules, fmt.Sprintf("%s(DNS idx:%d)", domainRule, info.clientIdx))
+		if clientUsed[info.clientIdx] {
+			continue
+		}
+		clientUsed[info.clientIdx] = true
+		clients = append(clients, client)
+		clientNames = append(clientNames, client.Name())
+		hasMatch = true
+	}
+
+	if !(s.disableFallback || s.disableFallbackIfMatch && hasMatch) {
+		// Default round-robin query
+		for idx, client := range s.clients {
+			if clientUsed[idx] || client.skipFallback {
+				continue
+			}
+			clientUsed[idx] = true
+			clients = append(clients, client)
+			clientNames = append(clientNames, client.Name())
+		}
+	}
+
+	if len(domainRules) > 0 {
+		errors.LogDebug(s.ctx, "domain ", domain, " matches following rules: ", domainRules)
+	}
+	if len(clientNames) > 0 {
+		errors.LogDebug(s.ctx, "domain ", domain, " will use DNS in order: ", clientNames)
+	}
+
+	if len(clients) == 0 {
+		clients = append(clients, s.clients[0])
+		clientNames = append(clientNames, s.clients[0].Name())
+		errors.LogDebug(s.ctx, "domain ", domain, " will use the first DNS: ", clientNames)
+	}
+
+	return clients
+}
 
 func init() {
 	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
-		h := new(Handler)
-		if err := core.RequireFeatures(ctx, func(dnsClient dns.Client, policyManager policy.Manager) error {
-			core.RequireFeatures(ctx, func(fdns dns.FakeDNSEngine) {
-				h.fdns = fdns
-			})
-			return h.Init(config.(*Config), dnsClient, policyManager)
-		}); err != nil {
-			return nil, err
-		}
-		return h, nil
+		return New(ctx, config.(*Config))
 	}))
-}
-
-type ownLinkVerifier interface {
-	IsOwnLink(ctx context.Context) bool
-}
-
-type Handler struct {
-	client          dns.Client
-	fdns            dns.FakeDNSEngine
-	ownLinkVerifier ownLinkVerifier
-	server          net.Destination
-	timeout         time.Duration
-	nonIPQuery      string
-}
-
-func (h *Handler) Init(config *Config, dnsClient dns.Client, policyManager policy.Manager) error {
-	h.client = dnsClient
-	h.timeout = policyManager.ForLevel(config.UserLevel).Timeouts.ConnectionIdle
-
-	if v, ok := dnsClient.(ownLinkVerifier); ok {
-		h.ownLinkVerifier = v
-	}
-
-	if config.Server != nil {
-		h.server = config.Server.AsDestination()
-	}
-	h.nonIPQuery = config.Non_IPQuery
-	return nil
-}
-
-func (h *Handler) isOwnLink(ctx context.Context) bool {
-	return h.ownLinkVerifier != nil && h.ownLinkVerifier.IsOwnLink(ctx)
-}
-
-func parseIPQuery(b []byte) (r bool, domain string, id uint16, qType dnsmessage.Type) {
-	var parser dnsmessage.Parser
-	header, err := parser.Start(b)
-	if err != nil {
-		errors.LogInfoInner(context.Background(), err, "parser start")
-		return
-	}
-
-	id = header.ID
-	q, err := parser.Question()
-	if err != nil {
-		errors.LogInfoInner(context.Background(), err, "question")
-		return
-	}
-	qType = q.Type
-	if qType != dnsmessage.TypeA && qType != dnsmessage.TypeAAAA {
-		return
-	}
-
-	domain = q.Name.String()
-	r = true
-	return
-}
-
-// Process implements proxy.Outbound.
-func (h *Handler) Process(ctx context.Context, link *transport.Link, d internet.Dialer) error {
-	outbounds := session.OutboundsFromContext(ctx)
-	ob := outbounds[len(outbounds)-1]
-	if !ob.Target.IsValid() {
-		return errors.New("invalid outbound")
-	}
-	ob.Name = "dns"
-
-	srcNetwork := ob.Target.Network
-
-	dest := ob.Target
-	if h.server.Network != net.Network_Unknown {
-		dest.Network = h.server.Network
-	}
-	if h.server.Address != nil {
-		dest.Address = h.server.Address
-	}
-	if h.server.Port != 0 {
-		dest.Port = h.server.Port
-	}
-
-	errors.LogInfo(ctx, "handling DNS traffic to ", dest)
-
-	conn := &outboundConn{
-		dialer: func() (stat.Connection, error) {
-			return d.Dial(ctx, dest)
-		},
-		connReady: make(chan struct{}, 1),
-	}
-
-	var reader dns_proto.MessageReader
-	var writer dns_proto.MessageWriter
-	if srcNetwork == net.Network_TCP {
-		reader = dns_proto.NewTCPReader(link.Reader)
-		writer = &dns_proto.TCPWriter{
-			Writer: link.Writer,
-		}
-	} else {
-		reader = &dns_proto.UDPReader{
-			Reader: link.Reader,
-		}
-		writer = &dns_proto.UDPWriter{
-			Writer: link.Writer,
-		}
-	}
-
-	var connReader dns_proto.MessageReader
-	var connWriter dns_proto.MessageWriter
-	if dest.Network == net.Network_TCP {
-		connReader = dns_proto.NewTCPReader(buf.NewReader(conn))
-		connWriter = &dns_proto.TCPWriter{
-			Writer: buf.NewWriter(conn),
-		}
-	} else {
-		connReader = &dns_proto.UDPReader{
-			Reader: buf.NewPacketReader(conn),
-		}
-		connWriter = &dns_proto.UDPWriter{
-			Writer: buf.NewWriter(conn),
-		}
-	}
-
-	if session.TimeoutOnlyFromContext(ctx) {
-		ctx, _ = context.WithCancel(context.Background())
-	}
-
-	ctx, cancel := context.WithCancel(ctx)
-	timer := signal.CancelAfterInactivity(ctx, cancel, h.timeout)
-
-	request := func() error {
-		defer conn.Close()
-
-		for {
-			b, err := reader.ReadMessage()
-			if err == io.EOF {
-				return nil
-			}
-
-			if err != nil {
-				return err
-			}
-
-			timer.Update()
-
-			if !h.isOwnLink(ctx) {
-				isIPQuery, domain, id, qType := parseIPQuery(b.Bytes())
-				if isIPQuery {
-					go h.handleIPQuery(id, qType, domain, writer)
-				}
-				if isIPQuery || h.nonIPQuery == "drop" || qType == 65 {
-					b.Release()
-					continue
-				}
-			}
-
-			if err := connWriter.WriteMessage(b); err != nil {
-				return err
-			}
-		}
-	}
-
-	response := func() error {
-		for {
-			b, err := connReader.ReadMessage()
-			if err == io.EOF {
-				return nil
-			}
-
-			if err != nil {
-				return err
-			}
-
-			timer.Update()
-
-			if err := writer.WriteMessage(b); err != nil {
-				return err
-			}
-		}
-	}
-
-	if err := task.Run(ctx, request, response); err != nil {
-		return errors.New("connection ends").Base(err)
-	}
-
-	return nil
-}
-
-func (h *Handler) handleIPQuery(id uint16, qType dnsmessage.Type, domain string, writer dns_proto.MessageWriter) {
-	var ips []net.IP
-	var err error
-
-	var ttl uint32 = 600
-
-	switch qType {
-	case dnsmessage.TypeA:
-		ips, err = h.client.LookupIP(domain, dns.IPOption{
-			IPv4Enable: true,
-			IPv6Enable: false,
-			FakeEnable: true,
-		})
-	case dnsmessage.TypeAAAA:
-		ips, err = h.client.LookupIP(domain, dns.IPOption{
-			IPv4Enable: false,
-			IPv6Enable: true,
-			FakeEnable: true,
-		})
-	}
-
-	rcode := dns.RCodeFromError(err)
-	if rcode == 0 && len(ips) == 0 && !errors.AllEqual(dns.ErrEmptyResponse, errors.Cause(err)) {
-		errors.LogInfoInner(context.Background(), err, "ip query")
-		return
-	}
-
-	if fkr0, ok := h.fdns.(dns.FakeDNSEngineRev0); ok && len(ips) > 0 && fkr0.IsIPInIPPool(net.IPAddress(ips[0])) {
-		ttl = 1
-	}
-
-	switch qType {
-	case dnsmessage.TypeA:
-		for i, ip := range ips {
-			ips[i] = ip.To4()
-		}
-	case dnsmessage.TypeAAAA:
-		for i, ip := range ips {
-			ips[i] = ip.To16()
-		}
-	}
-
-	b := buf.New()
-	rawBytes := b.Extend(buf.Size)
-	builder := dnsmessage.NewBuilder(rawBytes[:0], dnsmessage.Header{
-		ID:                 id,
-		RCode:              dnsmessage.RCode(rcode),
-		RecursionAvailable: true,
-		RecursionDesired:   true,
-		Response:           true,
-		Authoritative:      true,
-	})
-	builder.EnableCompression()
-	common.Must(builder.StartQuestions())
-	common.Must(builder.Question(dnsmessage.Question{
-		Name:  dnsmessage.MustNewName(domain),
-		Class: dnsmessage.ClassINET,
-		Type:  qType,
-	}))
-	common.Must(builder.StartAnswers())
-
-	rHeader := dnsmessage.ResourceHeader{Name: dnsmessage.MustNewName(domain), Class: dnsmessage.ClassINET, TTL: ttl}
-	for _, ip := range ips {
-		if len(ip) == net.IPv4len {
-			var r dnsmessage.AResource
-			copy(r.A[:], ip)
-			common.Must(builder.AResource(rHeader, r))
-		} else {
-			var r dnsmessage.AAAAResource
-			copy(r.AAAA[:], ip)
-			common.Must(builder.AAAAResource(rHeader, r))
-		}
-	}
-	msgBytes, err := builder.Finish()
-	if err != nil {
-		errors.LogInfoInner(context.Background(), err, "pack message")
-		b.Release()
-		return
-	}
-	b.Resize(0, int32(len(msgBytes)))
-
-	if err := writer.WriteMessage(b); err != nil {
-		errors.LogInfoInner(context.Background(), err, "write IP answer")
-	}
-}
-
-type outboundConn struct {
-	access sync.Mutex
-	dialer func() (stat.Connection, error)
-
-	conn      net.Conn
-	connReady chan struct{}
-}
-
-func (c *outboundConn) dial() error {
-	conn, err := c.dialer()
-	if err != nil {
-		return err
-	}
-	c.conn = conn
-	c.connReady <- struct{}{}
-	return nil
-}
-
-func (c *outboundConn) Write(b []byte) (int, error) {
-	c.access.Lock()
-
-	if c.conn == nil {
-		if err := c.dial(); err != nil {
-			c.access.Unlock()
-			errors.LogWarningInner(context.Background(), err, "failed to dial outbound connection")
-			return len(b), nil
-		}
-	}
-
-	c.access.Unlock()
-
-	return c.conn.Write(b)
-}
-
-func (c *outboundConn) Read(b []byte) (int, error) {
-	var conn net.Conn
-	c.access.Lock()
-	conn = c.conn
-	c.access.Unlock()
-
-	if conn == nil {
-		_, open := <-c.connReady
-		if !open {
-			return 0, io.EOF
-		}
-		conn = c.conn
-	}
-
-	return conn.Read(b)
-}
-
-func (c *outboundConn) Close() error {
-	c.access.Lock()
-	close(c.connReady)
-	if c.conn != nil {
-		c.conn.Close()
-	}
-	c.access.Unlock()
-	return nil
 }
